@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Servo.h>
+#include <DHT.h>
 
 // ── LCD ──
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -21,17 +22,24 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 // ── Servo ──
 Servo porte;
 
+// ── DHT11 ──
+#define DHT_PIN  3
+#define DHTTYPE  DHT11
+DHT dht(DHT_PIN, DHTTYPE);
+
 // ── Broches ──
 const int TRIG_PIN   = 4;
 const int ECHO_PIN   = 5;
-const int BUZZER     = 8;
-const int LED_VERTE  = 7;
 const int LED_ROUGE  = 6;
+const int LED_VERTE  = 7;
+const int RELAIS_PIN = 8;
 const int SERVO_PIN  = 3;
 const int FLAMME_PIN = 2;
+const int EAU_PIN    = A0;
 
 // ── Seuils ──
-const int SEUIL = 80;
+const int SEUIL_DISTANCE = 80;
+const int SEUIL_EAU      = 300;
 
 // ── Anti-rebond flamme ──
 int flammeCompteur = 0;
@@ -40,31 +48,39 @@ int flammeCompteur = 0;
 byte uidCarte[]    = {0xFB, 0xE5, 0x0D, 0x07};
 byte uidPorteCle[] = {0xCB, 0xBD, 0x2A, 0x07};
 
-// ── Fonctions ──
-
 long mesurerDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  long duree = pulseIn(ECHO_PIN, HIGH);
+  long duree = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duree == 0) return -1;
   return duree / 58;
 }
 
 bool lireFlammeConfirmee() {
   int lecture = digitalRead(FLAMME_PIN);
-  if (lecture == HIGH) {
-    flammeCompteur++;
-  } else {
-    flammeCompteur = 0;
-  }
+  if (lecture == HIGH) flammeCompteur++;
+  else flammeCompteur = 0;
   return (flammeCompteur >= 2);
+}
+
+// ── Envoi vers ESP32 via Pin 1 (TX) ──
+void envoyerESP32(float temp, float hum, long distance, String etat) {
+  Serial.print("TEMP:");
+  Serial.print((int)temp);
+  Serial.print("|HUM:");
+  Serial.print((int)hum);
+  Serial.print("|DIST:");
+  Serial.print(distance);
+  Serial.print("|ETAT:");
+  Serial.println(etat);
 }
 
 void afficherHeure() {
   RtcDateTime now = rtc.GetDateTime();
-  lcd.setCursor(7, 1);
+  lcd.setCursor(8, 1);
   if (now.Hour() < 10)   lcd.print("0");
   lcd.print(now.Hour());
   lcd.print(":");
@@ -88,36 +104,30 @@ bool verifierAcces(byte *uid, byte taille) {
 void accesAutorise() {
   digitalWrite(LED_VERTE, HIGH);
   digitalWrite(LED_ROUGE, LOW);
-  digitalWrite(BUZZER, LOW);
-  porte.write(90);
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Acces autorise");
   lcd.setCursor(0, 1);
   lcd.print("Bienvenue !");
-  Serial.println("ACCES:AUTORISE");
-  delay(3000);
-  porte.write(0);
+  envoyerESP32(0, 0, 0, "ACCES_OK");
+  delay(2000);
   digitalWrite(LED_VERTE, LOW);
 }
 
 void accesRefuse() {
   digitalWrite(LED_ROUGE, HIGH);
   digitalWrite(LED_VERTE, LOW);
-  digitalWrite(BUZZER, HIGH);
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Acces refuse !");
   lcd.setCursor(0, 1);
   lcd.print("Badge inconnu");
-  Serial.println("ACCES:REFUSE");
+  envoyerESP32(0, 0, 0, "ACCES_REFUSE");
   delay(1000);
   digitalWrite(LED_ROUGE, LOW);
-  digitalWrite(BUZZER, LOW);
 }
 
-void alerteIncendie() {
-  digitalWrite(BUZZER, HIGH);
+void alerteIncendie(float temp, float hum) {
   digitalWrite(LED_ROUGE, HIGH);
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
@@ -126,14 +136,30 @@ void alerteIncendie() {
   lcd.setCursor(0, 1);
   lcd.print("ALERTE FLAMME ");
   afficherHeure();
-  Serial.println("ALERTE:INCENDIE");
+  envoyerESP32(temp, hum, 0, "INCENDIE");
   delay(500);
-  digitalWrite(BUZZER, LOW);
+  digitalWrite(LED_ROUGE, LOW);
   delay(500);
 }
 
-void alerteIntrusion(long distance) {
-  digitalWrite(BUZZER, HIGH);
+void alerteInondation(int niveau, float temp, float hum) {
+  digitalWrite(LED_ROUGE, HIGH);
+  digitalWrite(LED_VERTE, LOW);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("!! INONDATION !!");
+  lcd.setCursor(0, 1);
+  lcd.print("Niv:");
+  lcd.print(niveau);
+  lcd.print(" ");
+  afficherHeure();
+  envoyerESP32(temp, hum, 0, "INONDATION");
+  delay(500);
+  digitalWrite(LED_ROUGE, LOW);
+  delay(500);
+}
+
+void alerteIntrusion(long distance, float temp, float hum) {
   digitalWrite(LED_ROUGE, HIGH);
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
@@ -144,111 +170,101 @@ void alerteIntrusion(long distance) {
   lcd.print(distance);
   lcd.print("cm ");
   afficherHeure();
-  Serial.print("ALERTE:INTRUSION:");
-  Serial.println(distance);
+  envoyerESP32(temp, hum, distance, "INTRUSION");
   delay(500);
-  digitalWrite(BUZZER, LOW);
+  digitalWrite(LED_ROUGE, LOW);
   delay(500);
 }
 
-void etatNormal(long distance) {
-  digitalWrite(BUZZER, LOW);
+void etatNormal(long distance, int eau, float temp, float hum) {
   digitalWrite(LED_ROUGE, LOW);
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Systeme OK");
+  lcd.print("T:");
+  lcd.print((int)temp);
+  lcd.print("C H:");
+  lcd.print((int)hum);
+  lcd.print("%");
   lcd.setCursor(0, 1);
-  lcd.print("D:");
-  lcd.print(distance);
-  lcd.print("cm ");
   afficherHeure();
+  envoyerESP32(temp, hum, distance, "OK");
 }
 
-// ── Setup ──
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(9600); // ⚠️ même vitesse que l'ESP32 (Serial2 à 9600)
 
-  // LCD
   Wire.begin();
   lcd.init();
   lcd.backlight();
 
-  // RTC
   rtc.Begin();
   rtc.SetIsWriteProtected(false);
-  RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
-  rtc.SetDateTime(compiled);
+  RtcDateTime maintenant = RtcDateTime(2026, 6, 13, 15, 30, 0); // ⚠️ adapte à l'heure réelle
+  rtc.SetDateTime(maintenant);
 
-  // RFID
   SPI.begin();
   rfid.PCD_Init();
 
-  // Servo
-  porte.attach(SERVO_PIN);
-  porte.write(0);
+  dht.begin();
 
-  // Broches
   pinMode(TRIG_PIN,   OUTPUT);
   pinMode(ECHO_PIN,   INPUT);
-  pinMode(BUZZER,     OUTPUT);
-  pinMode(LED_VERTE,  OUTPUT);
   pinMode(LED_ROUGE,  OUTPUT);
+  pinMode(LED_VERTE,  OUTPUT);
   pinMode(FLAMME_PIN, INPUT);
+  pinMode(RELAIS_PIN, OUTPUT);
+  digitalWrite(RELAIS_PIN, LOW);
 
-  // Démarrage
   lcd.setCursor(0, 0);
   lcd.print("Smart Home");
   lcd.setCursor(0, 1);
   lcd.print("Demarrage...");
-  Serial.println("=== SMART HOME DEMARRE ===");
   delay(2000);
 }
 
-// ── Loop ──
 void loop() {
 
-  // ── Lecture capteurs ──
-  long distance = mesurerDistance();
-  bool flamme   = lireFlammeConfirmee();
+  rfid.PCD_Init();
 
-  Serial.print("Distance:");
-  Serial.print(distance);
-  Serial.print("cm | Flamme:");
-  Serial.println(flamme ? "OUI" : "NON");
+  long  distance = mesurerDistance();
+  bool  flamme   = lireFlammeConfirmee();
+  int   eau      = analogRead(EAU_PIN);
+  float temp     = dht.readTemperature();
+  float hum      = dht.readHumidity();
+  if (isnan(temp)) temp = 0;
+  if (isnan(hum))  hum  = 0;
+
+  // ── Relais éclairage selon l'heure ──
+  RtcDateTime now = rtc.GetDateTime();
+  if (now.Hour() >= 18 || now.Hour() < 6) {
+    digitalWrite(RELAIS_PIN, LOW);
+  } else {
+    digitalWrite(RELAIS_PIN, HIGH);
+  }
 
   // ── RFID ──
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    Serial.print("UID : ");
-    for (byte i = 0; i < rfid.uid.size; i++) {
-      Serial.print(rfid.uid.uidByte[i], HEX);
-      Serial.print(" ");
-    }
-    Serial.println();
-    if (verifierAcces(rfid.uid.uidByte, rfid.uid.size)) {
-      accesAutorise();
-    } else {
-      accesRefuse();
-    }
+    if (verifierAcces(rfid.uid.uidByte, rfid.uid.size)) accesAutorise();
+    else accesRefuse();
     rfid.PICC_HaltA();
     flammeCompteur = 0;
     return;
   }
 
-  // ── Priorités d'alerte ──
-
-  // Priorité 1 — Incendie
+  // ── Priorités ──
   if (flamme) {
-    alerteIncendie();
+    alerteIncendie(temp, hum);
     flammeCompteur = 0;
   }
-  // Priorité 2 — Intrusion
-  else if (distance > 0 && distance < SEUIL) {
-    alerteIntrusion(distance);
+  else if (eau > SEUIL_EAU) {
+    alerteInondation(eau, temp, hum);
   }
-  // État normal
+  else if (distance > 0 && distance < SEUIL_DISTANCE) {
+    alerteIntrusion(distance, temp, hum);
+  }
   else {
-    etatNormal(distance);
+    etatNormal(distance, eau, temp, hum);
   }
 
   delay(500);
