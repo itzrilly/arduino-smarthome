@@ -5,7 +5,6 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Servo.h>
-#include <DHT.h>
 
 // ── LCD ──
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -21,11 +20,6 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 
 // ── Servo ──
 Servo porte;
-
-// ── DHT11 ──
-#define DHT_PIN  3
-#define DHTTYPE  DHT11
-DHT dht(DHT_PIN, DHTTYPE);
 
 // ── Broches ──
 const int TRIG_PIN   = 4;
@@ -43,6 +37,11 @@ const int SEUIL_EAU      = 300;
 
 // ── Anti-rebond flamme ──
 int flammeCompteur = 0;
+
+// ── Commandes depuis ESP32 ──
+bool relaisManuel  = false; // true = commande manuelle du relais via dashboard
+bool relaisEtat    = false; // état voulu du relais en mode manuel
+bool alarmeCoupee  = false; // true = alarme coupée manuellement
 
 // ── UID autorisés ──
 byte uidCarte[]    = {0xFB, 0xE5, 0x0D, 0x07};
@@ -66,16 +65,37 @@ bool lireFlammeConfirmee() {
   return (flammeCompteur >= 2);
 }
 
-// ── Envoi vers ESP32 via Pin 1 (TX) ──
-void envoyerESP32(float temp, float hum, long distance, String etat) {
-  Serial.print("TEMP:");
-  Serial.print((int)temp);
-  Serial.print("|HUM:");
-  Serial.print((int)hum);
-  Serial.print("|DIST:");
+void envoyerESP32(long distance, String etat) {
+  Serial.print("TEMP:0|HUM:0|DIST:");
   Serial.print(distance);
   Serial.print("|ETAT:");
   Serial.println(etat);
+}
+
+// ── Lecture des commandes venant de l'ESP32 ──
+void lireCommandeESP32() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "LUM_ON") {
+      relaisManuel = true;
+      relaisEtat   = true;
+    }
+    else if (cmd == "LUM_OFF") {
+      relaisManuel = true;
+      relaisEtat   = false;
+    }
+    else if (cmd == "LUM_AUTO") {
+      relaisManuel = false;
+    }
+    else if (cmd == "ALARME_OFF") {
+      alarmeCoupee = true;
+    }
+    else if (cmd == "ALARME_ON") {
+      alarmeCoupee = false;
+    }
+  }
 }
 
 void afficherHeure() {
@@ -109,7 +129,7 @@ void accesAutorise() {
   lcd.print("Acces autorise");
   lcd.setCursor(0, 1);
   lcd.print("Bienvenue !");
-  envoyerESP32(0, 0, 0, "ACCES_OK");
+  envoyerESP32(0, "ACCES_OK");
   delay(2000);
   digitalWrite(LED_VERTE, LOW);
 }
@@ -122,13 +142,15 @@ void accesRefuse() {
   lcd.print("Acces refuse !");
   lcd.setCursor(0, 1);
   lcd.print("Badge inconnu");
-  envoyerESP32(0, 0, 0, "ACCES_REFUSE");
+  envoyerESP32(0, "ACCES_REFUSE");
   delay(1000);
   digitalWrite(LED_ROUGE, LOW);
 }
 
-void alerteIncendie(float temp, float hum) {
-  digitalWrite(LED_ROUGE, HIGH);
+void alerteIncendie() {
+  if (!alarmeCoupee) {
+    digitalWrite(LED_ROUGE, HIGH);
+  }
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -136,14 +158,16 @@ void alerteIncendie(float temp, float hum) {
   lcd.setCursor(0, 1);
   lcd.print("ALERTE FLAMME ");
   afficherHeure();
-  envoyerESP32(temp, hum, 0, "INCENDIE");
+  envoyerESP32(0, "INCENDIE");
   delay(500);
   digitalWrite(LED_ROUGE, LOW);
   delay(500);
 }
 
-void alerteInondation(int niveau, float temp, float hum) {
-  digitalWrite(LED_ROUGE, HIGH);
+void alerteInondation(int niveau) {
+  if (!alarmeCoupee) {
+    digitalWrite(LED_ROUGE, HIGH);
+  }
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -153,14 +177,16 @@ void alerteInondation(int niveau, float temp, float hum) {
   lcd.print(niveau);
   lcd.print(" ");
   afficherHeure();
-  envoyerESP32(temp, hum, 0, "INONDATION");
+  envoyerESP32(0, "INONDATION");
   delay(500);
   digitalWrite(LED_ROUGE, LOW);
   delay(500);
 }
 
-void alerteIntrusion(long distance, float temp, float hum) {
-  digitalWrite(LED_ROUGE, HIGH);
+void alerteIntrusion(long distance) {
+  if (!alarmeCoupee) {
+    digitalWrite(LED_ROUGE, HIGH);
+  }
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -170,29 +196,25 @@ void alerteIntrusion(long distance, float temp, float hum) {
   lcd.print(distance);
   lcd.print("cm ");
   afficherHeure();
-  envoyerESP32(temp, hum, distance, "INTRUSION");
+  envoyerESP32(distance, "INTRUSION");
   delay(500);
   digitalWrite(LED_ROUGE, LOW);
   delay(500);
 }
 
-void etatNormal(long distance, int eau, float temp, float hum) {
+void etatNormal(long distance) {
   digitalWrite(LED_ROUGE, LOW);
   digitalWrite(LED_VERTE, LOW);
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("T:");
-  lcd.print((int)temp);
-  lcd.print("C H:");
-  lcd.print((int)hum);
-  lcd.print("%");
+  lcd.print("Systeme OK");
   lcd.setCursor(0, 1);
   afficherHeure();
-  envoyerESP32(temp, hum, distance, "OK");
+  envoyerESP32(distance, "OK");
 }
 
 void setup() {
-  Serial.begin(9600); // ⚠️ même vitesse que l'ESP32 (Serial2 à 9600)
+  Serial.begin(9600);
 
   Wire.begin();
   lcd.init();
@@ -200,13 +222,14 @@ void setup() {
 
   rtc.Begin();
   rtc.SetIsWriteProtected(false);
-  RtcDateTime maintenant = RtcDateTime(2026, 6, 13, 15, 30, 0); // ⚠️ adapte à l'heure réelle
+  RtcDateTime maintenant = RtcDateTime(2026, 6, 13, 19, 30, 0); // ⚠️ adapte heure réelle
   rtc.SetDateTime(maintenant);
 
   SPI.begin();
   rfid.PCD_Init();
 
-  dht.begin();
+  porte.attach(SERVO_PIN);
+  porte.write(0);
 
   pinMode(TRIG_PIN,   OUTPUT);
   pinMode(ECHO_PIN,   INPUT);
@@ -226,21 +249,25 @@ void setup() {
 void loop() {
 
   rfid.PCD_Init();
+  lireCommandeESP32();
 
-  long  distance = mesurerDistance();
-  bool  flamme   = lireFlammeConfirmee();
-  int   eau      = analogRead(EAU_PIN);
-  float temp     = dht.readTemperature();
-  float hum      = dht.readHumidity();
-  if (isnan(temp)) temp = 0;
-  if (isnan(hum))  hum  = 0;
+  // ── Écoute des commandes ESP32 ──
+  lireCommandeESP32();
 
-  // ── Relais éclairage selon l'heure ──
-  RtcDateTime now = rtc.GetDateTime();
-  if (now.Hour() >= 18 || now.Hour() < 6) {
-    digitalWrite(RELAIS_PIN, LOW);
+  long distance = mesurerDistance();
+  bool flamme   = lireFlammeConfirmee();
+  int  eau      = analogRead(EAU_PIN);
+
+  // ── Relais : le mode MANUEL est prioritaire et persistant ──
+  if (relaisManuel) {
+    digitalWrite(RELAIS_PIN, relaisEtat ? LOW : HIGH);
   } else {
-    digitalWrite(RELAIS_PIN, HIGH);
+    RtcDateTime now = rtc.GetDateTime();
+    if (now.Hour() >= 18 || now.Hour() < 6) {
+      digitalWrite(RELAIS_PIN, LOW);
+    } else {
+      digitalWrite(RELAIS_PIN, HIGH);
+    }
   }
 
   // ── RFID ──
@@ -254,18 +281,18 @@ void loop() {
 
   // ── Priorités ──
   if (flamme) {
-    alerteIncendie(temp, hum);
+    alerteIncendie();
     flammeCompteur = 0;
   }
   else if (eau > SEUIL_EAU) {
-    alerteInondation(eau, temp, hum);
+    alerteInondation(eau);
   }
   else if (distance > 0 && distance < SEUIL_DISTANCE) {
-    alerteIntrusion(distance, temp, hum);
+    alerteIntrusion(distance);
   }
   else {
-    etatNormal(distance, eau, temp, hum);
+    etatNormal(distance);
   }
 
-  delay(500);
+  delay(200);
 }
